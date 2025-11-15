@@ -1,215 +1,104 @@
-use axum::{
-    extract::Query,
-    http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
-use bytes::Bytes;
-use image::{io::Reader as ImageReader, ImageFormat};
-use serde::Deserialize;
-use sha1::{Digest, Sha1};
-use std::net::SocketAddr;
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-use tower_http::cors::CorsLayer;
-#[derive(Deserialize)]
-struct ImageParams {
-    quality: Option<u8>,
-    width: Option<u32>,
-    height: Option<u32>,
-    image_url: String,
-}
+use actix_multipart::Multipart;
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use futures_util::StreamExt;
+use std::io::Cursor;
 
-#[derive(Clone)]
-struct ProcessedImageResult {
-    data: Vec<u8>,
-    content_type: String,
-    original_width: u32,
-    original_height: u32,
-    etag: String,
-}
+use image::{io::Reader as ImageReader, DynamicImage, ImageBuffer, ImageOutputFormat, Rgba};
 
-#[derive(Clone)]
-struct CacheEntry {
-    result: ProcessedImageResult,
-    size: usize,
-    inserted: Instant,
-}
+use fast_image_resize as fir;
+use fast_image_resize::images::Image;
+use fast_image_resize::Resizer;
 
-type ImageCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
+async fn resize_image(mut payload: Multipart) -> impl Responder {
+    while let Some(item) = payload.next().await {
+        if let Ok(mut field) = item {
+            let mut data = Vec::new();
+            while let Some(chunk) = field.next().await {
+                let chunk = chunk.unwrap();
+                data.extend_from_slice(&chunk);
+            }
 
-const CACHE_TTL: Duration = Duration::from_secs(3600);
-const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024;
-const MAX_DIM: u32 = 1920; // максимальная ширина/высота для ресайза
+            // Загружаем изображение с определением формата
+            let img_reader = ImageReader::new(Cursor::new(&data))
+                .with_guessed_format()
+                .unwrap();
+            let format = img_reader.format().unwrap(); // сохраняем формат (JPEG, PNG и т.д.)
+            let img = img_reader.decode().unwrap().to_rgba8();
 
-use tokio::net::TcpListener;
+            let (width, height) = img.dimensions();
 
-#[tokio::main]
-async fn main() {
-    let cache: ImageCache = Arc::new(Mutex::new(HashMap::new()));
-    let app = Router::new()
-        .route(
-            "/optimize",
-            get({
-                let cache = cache.clone();
-                move |params| optimize_image(params, cache.clone())
-            }),
-        )
-        .layer(CorsLayer::permissive());
+            // Создаем Image для fast_image_resize
+            let mut src_image = Image::new(width, height, fir::PixelType::U8x4);
+            src_image.buffer_mut().copy_from_slice(&img.into_raw());
 
-    // Tokio TcpListener
-    let listener = TcpListener::bind("0.0.0.0:3001").await.unwrap();
-    println!("🚀 Rust Image Optimizer running on http://0.0.0.0:3001");
+            // Целевой размер
+            let dst_width: u32 = 200;
+            let dst_height: u32 = 200;
+            let mut dst_image = Image::new(dst_width, dst_height, fir::PixelType::U8x4);
 
-    axum::serve(listener, app).await.unwrap();
-}
+            // Ресайз
+            let mut resizer = Resizer::new();
+            resizer.resize(&src_image, &mut dst_image, None).unwrap();
 
-async fn optimize_image(
-    Query(params): Query<ImageParams>,
-    cache: ImageCache,
-) -> Result<impl IntoResponse, StatusCode> {
-    let cache_key = format!(
-        "{}:{}:{}:{}",
-        params.image_url,
-        params.width.unwrap_or(0),
-        params.height.unwrap_or(0),
-        params.quality.unwrap_or(80)
-    );
+            // Конвертируем обратно в DynamicImage
+            let buffer = dst_image.buffer();
+            let img_buffer =
+                ImageBuffer::<Rgba<u8>, _>::from_raw(dst_width, dst_height, buffer.to_vec())
+                    .unwrap();
+            let dyn_image = DynamicImage::ImageRgba8(img_buffer);
 
-    // Проверка кэша
-    if let Some(entry) = cache.lock().unwrap().get(&cache_key) {
-        if entry.inserted.elapsed() < CACHE_TTL {
-            let mut headers = HeaderMap::new();
-            headers.insert("Content-Type", entry.result.content_type.parse().unwrap());
-            headers.insert(
-                "Cache-Control",
-                HeaderValue::from_static("public, max-age=3600"),
-            );
-            headers.insert("ETag", entry.result.etag.parse().unwrap());
-            return Ok((StatusCode::OK, headers, entry.result.data.clone()));
+            let mut bytes = Vec::new();
+            let content_type = match format {
+                image::ImageFormat::Png => {
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Png)
+                        .unwrap();
+                    "image/png"
+                }
+                image::ImageFormat::Jpeg => {
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Jpeg(80))
+                        .unwrap();
+                    "image/jpeg"
+                }
+                image::ImageFormat::Gif => {
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Gif)
+                        .unwrap();
+                    "image/gif"
+                }
+                image::ImageFormat::Bmp => {
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Bmp)
+                        .unwrap();
+                    "image/bmp"
+                }
+                image::ImageFormat::Tiff => {
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Tiff)
+                        .unwrap();
+                    "image/tiff"
+                }
+                _ => {
+                    // если формат неизвестен, используем PNG как fallback
+                    dyn_image
+                        .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Png)
+                        .unwrap();
+                    "image/png"
+                }
+            };
+
+            return HttpResponse::Ok().content_type(content_type).body(bytes);
         }
     }
 
-    // Получаем изображение
-    let image_bytes = reqwest::get(&params.image_url)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Обработка изображения в отдельном потоке
-    let result = tokio::task::spawn_blocking(move || process_image(image_bytes, params))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Генерация ETag
-    let etag = format!("{:x}", Sha1::digest(&result.data));
-
-    let result = ProcessedImageResult {
-        etag: etag.clone(),
-        ..result
-    };
-
-    // Добавляем в кэш
-    {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.insert(
-            cache_key,
-            CacheEntry {
-                size: result.data.len(),
-                result: result.clone(),
-                inserted: Instant::now(),
-            },
-        );
-        enforce_cache_limit(&mut cache_lock);
-    }
-
-    // Ответ с headers
-    let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", result.content_type.parse().unwrap());
-    headers.insert(
-        "Cache-Control",
-        HeaderValue::from_static("public, max-age=3600"),
-    );
-    headers.insert("ETag", etag.parse().unwrap());
-
-    Ok((StatusCode::OK, headers, result.data))
+    HttpResponse::BadRequest().body("No file uploaded")
 }
 
-// Ограничение кэша по размеру
-fn enforce_cache_limit(cache: &mut HashMap<String, CacheEntry>) {
-    let mut total_size: usize = cache.values().map(|e| e.size).sum();
-    if total_size <= CACHE_MAX_SIZE {
-        return;
-    }
-
-    let mut keys: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.inserted)).collect();
-    keys.sort_by_key(|(_, inserted)| *inserted);
-
-    for (key, _) in keys {
-        if let Some(entry) = cache.remove(&key) {
-            total_size -= entry.size;
-        }
-        if total_size <= CACHE_MAX_SIZE {
-            break;
-        }
-    }
-}
-
-// Обработка изображения с минимальной нагрузкой CPU
-fn process_image(data: Bytes, params: ImageParams) -> Result<ProcessedImageResult, String> {
-    let reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
-
-    let mut img = reader.decode().map_err(|e| e.to_string())?;
-    let original_width = img.width();
-    let original_height = img.height();
-
-    // Ограничиваем максимальный размер входного изображения
-    let scale = (MAX_DIM as f32 / img.width().max(img.height()) as f32).min(1.0);
-    if scale < 1.0 {
-        let new_w = (img.width() as f32 * scale) as u32;
-        let new_h = (img.height() as f32 * scale) as u32;
-        img = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
-    }
-
-    // Ресайз по пользовательским параметрам
-    if params.width.is_some() || params.height.is_some() {
-        img = match (params.width, params.height) {
-            (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Triangle),
-            (Some(w), None) => img.resize(
-                w,
-                ((w as f32 / img.width() as f32) * img.height() as f32) as u32,
-                image::imageops::FilterType::Triangle,
-            ),
-            (None, Some(h)) => img.resize(
-                ((h as f32 / img.height() as f32) * img.width() as f32) as u32,
-                h,
-                image::imageops::FilterType::Triangle,
-            ),
-            _ => img,
-        };
-    }
-
-    let quality = params.quality.unwrap_or(80).clamp(1, 100);
-
-    let mut output = Vec::with_capacity((img.width() * img.height() * 3) as usize);
-    let mut jpeg_encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
-    jpeg_encoder.encode_image(&img).map_err(|e| e.to_string())?;
-
-    Ok(ProcessedImageResult {
-        data: output,
-        content_type: "image/jpeg".to_string(),
-        original_width,
-        original_height,
-        etag: "".to_string(),
-    })
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    HttpServer::new(|| App::new().route("/resize", web::post().to(resize_image)))
+        .bind("127.0.0.1:8080")?
+        .run()
+        .await
 }
