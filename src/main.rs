@@ -9,6 +9,7 @@ use bytes::Bytes;
 use image::{io::Reader as ImageReader, ImageFormat};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
+use std::net::SocketAddr;
 use std::{
     collections::HashMap,
     io::Cursor,
@@ -16,7 +17,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tower_http::cors::CorsLayer;
-
 #[derive(Deserialize)]
 struct ImageParams {
     quality: Option<u8>,
@@ -45,6 +45,9 @@ type ImageCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024;
+const MAX_DIM: u32 = 1920; // максимальная ширина/высота для ресайза
+
+use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
@@ -59,8 +62,8 @@ async fn main() {
         )
         .layer(CorsLayer::permissive());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
-
+    // Tokio TcpListener
+    let listener = TcpListener::bind("0.0.0.0:3001").await.unwrap();
     println!("🚀 Rust Image Optimizer running on http://0.0.0.0:3001");
 
     axum::serve(listener, app).await.unwrap();
@@ -100,14 +103,11 @@ async fn optimize_image(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Засекаем время начала обработки
-    let start = Instant::now();
+    // Обработка изображения в отдельном потоке
     let result = tokio::task::spawn_blocking(move || process_image(image_bytes, params))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let duration = start.elapsed();
-    println!("⏱ Image processing took: {:.2?}", duration);
 
     // Генерация ETag
     let etag = format!("{:x}", Sha1::digest(&result.data));
@@ -143,6 +143,7 @@ async fn optimize_image(
     Ok((StatusCode::OK, headers, result.data))
 }
 
+// Ограничение кэша по размеру
 fn enforce_cache_limit(cache: &mut HashMap<String, CacheEntry>) {
     let mut total_size: usize = cache.values().map(|e| e.size).sum();
     if total_size <= CACHE_MAX_SIZE {
@@ -162,6 +163,7 @@ fn enforce_cache_limit(cache: &mut HashMap<String, CacheEntry>) {
     }
 }
 
+// Обработка изображения с минимальной нагрузкой CPU
 fn process_image(data: Bytes, params: ImageParams) -> Result<ProcessedImageResult, String> {
     let reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
@@ -171,19 +173,27 @@ fn process_image(data: Bytes, params: ImageParams) -> Result<ProcessedImageResul
     let original_width = img.width();
     let original_height = img.height();
 
-    // Ресайз только при необходимости
+    // Ограничиваем максимальный размер входного изображения
+    let scale = (MAX_DIM as f32 / img.width().max(img.height()) as f32).min(1.0);
+    if scale < 1.0 {
+        let new_w = (img.width() as f32 * scale) as u32;
+        let new_h = (img.height() as f32 * scale) as u32;
+        img = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+    }
+
+    // Ресайз по пользовательским параметрам
     if params.width.is_some() || params.height.is_some() {
         img = match (params.width, params.height) {
-            (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Lanczos3),
+            (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Triangle),
             (Some(w), None) => img.resize(
                 w,
                 ((w as f32 / img.width() as f32) * img.height() as f32) as u32,
-                image::imageops::FilterType::Lanczos3,
+                image::imageops::FilterType::Triangle,
             ),
             (None, Some(h)) => img.resize(
                 ((h as f32 / img.height() as f32) * img.width() as f32) as u32,
                 h,
-                image::imageops::FilterType::Lanczos3,
+                image::imageops::FilterType::Triangle,
             ),
             _ => img,
         };
