@@ -22,6 +22,7 @@ struct ImageParams {
     quality: Option<u8>,
     width: Option<u32>,
     height: Option<u32>,
+    format: Option<String>,
     image_url: String,
 }
 
@@ -43,8 +44,9 @@ struct CacheEntry {
 
 type ImageCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 
-const CACHE_TTL: Duration = Duration::from_secs(3600);
-const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024;
+// Настройки кэша
+const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 час
+const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024; // 150 МБ
 
 #[tokio::main]
 async fn main() {
@@ -71,11 +73,12 @@ async fn optimize_image(
     cache: ImageCache,
 ) -> Result<impl IntoResponse, StatusCode> {
     let cache_key = format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         params.image_url,
         params.width.unwrap_or(0),
         params.height.unwrap_or(0),
-        params.quality.unwrap_or(80)
+        params.quality.unwrap_or(80),
+        params.format.clone().unwrap_or("jpeg".to_string())
     );
 
     // Проверка кэша
@@ -143,12 +146,14 @@ async fn optimize_image(
     Ok((StatusCode::OK, headers, result.data))
 }
 
+// Ограничение кэша по размеру
 fn enforce_cache_limit(cache: &mut HashMap<String, CacheEntry>) {
     let mut total_size: usize = cache.values().map(|e| e.size).sum();
     if total_size <= CACHE_MAX_SIZE {
         return;
     }
 
+    // Сортируем ключи по времени вставки (старые сначала)
     let mut keys: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.inserted)).collect();
     keys.sort_by_key(|(_, inserted)| *inserted);
 
@@ -171,33 +176,49 @@ fn process_image(data: Bytes, params: ImageParams) -> Result<ProcessedImageResul
     let original_width = img.width();
     let original_height = img.height();
 
-    // Ресайз только при необходимости
-    if params.width.is_some() || params.height.is_some() {
-        img = match (params.width, params.height) {
-            (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Lanczos3),
-            (Some(w), None) => img.resize(
-                w,
-                ((w as f32 / img.width() as f32) * img.height() as f32) as u32,
-                image::imageops::FilterType::Lanczos3,
-            ),
-            (None, Some(h)) => img.resize(
-                ((h as f32 / img.height() as f32) * img.width() as f32) as u32,
-                h,
-                image::imageops::FilterType::Lanczos3,
-            ),
-            _ => img,
-        };
-    }
+    // Ресайз изображения
+    img = match (params.width, params.height) {
+        (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Lanczos3),
+        (Some(w), None) => img.resize(
+            w,
+            ((w as f32 / img.width() as f32) * img.height() as f32) as u32,
+            image::imageops::FilterType::Lanczos3,
+        ),
+        (None, Some(h)) => img.resize(
+            ((h as f32 / img.height() as f32) * img.width() as f32) as u32,
+            h,
+            image::imageops::FilterType::Lanczos3,
+        ),
+        _ => img,
+    };
 
     let quality = params.quality.unwrap_or(80).clamp(1, 100);
+    let format = params.format.as_deref().unwrap_or("jpeg");
 
-    let mut output = Vec::with_capacity((img.width() * img.height() * 3) as usize);
-    let mut jpeg_encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
-    jpeg_encoder.encode_image(&img).map_err(|e| e.to_string())?;
+    let mut output = Vec::new();
+    let content_type = match format {
+        "webp" => {
+            let encoder = webp::Encoder::from_image(&img).map_err(|e| e.to_string())?;
+            let webp_data = encoder.encode(quality as f32);
+            output = webp_data.to_vec();
+            "image/webp"
+        }
+        "png" => {
+            img.write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
+                .map_err(|e| e.to_string())?;
+            "image/png"
+        }
+        _ => {
+            let mut jpeg_encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
+            jpeg_encoder.encode_image(&img).map_err(|e| e.to_string())?;
+            "image/jpeg"
+        }
+    };
 
     Ok(ProcessedImageResult {
         data: output,
-        content_type: "image/jpeg".to_string(),
+        content_type: content_type.to_string(),
         original_width,
         original_height,
         etag: "".to_string(),
