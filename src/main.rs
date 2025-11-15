@@ -44,9 +44,9 @@ struct CacheEntry {
 
 type ImageCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 
-// Настройки кэша
-const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 час
-const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024; // 150 МБ
+
+const CACHE_TTL: Duration = Duration::from_secs(3600); 
+const CACHE_MAX_SIZE: usize = 150 * 1024 * 1024; 
 
 #[tokio::main]
 async fn main() {
@@ -81,7 +81,7 @@ async fn optimize_image(
         params.format.clone().unwrap_or("jpeg".to_string())
     );
 
-    // Проверка кэша
+
     if let Some(entry) = cache.lock().unwrap().get(&cache_key) {
         if entry.inserted.elapsed() < CACHE_TTL {
             let mut headers = HeaderMap::new();
@@ -95,7 +95,6 @@ async fn optimize_image(
         }
     }
 
-    // Получаем изображение
     let image_bytes = reqwest::get(&params.image_url)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -103,7 +102,6 @@ async fn optimize_image(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Засекаем время начала обработки
     let start = Instant::now();
     let result = tokio::task::spawn_blocking(move || process_image(image_bytes, params))
         .await
@@ -112,7 +110,6 @@ async fn optimize_image(
     let duration = start.elapsed();
     println!("⏱ Image processing took: {:.2?}", duration);
 
-    // Генерация ETag
     let etag = format!("{:x}", Sha1::digest(&result.data));
 
     let result = ProcessedImageResult {
@@ -120,7 +117,6 @@ async fn optimize_image(
         ..result
     };
 
-    // Добавляем в кэш
     {
         let mut cache_lock = cache.lock().unwrap();
         cache_lock.insert(
@@ -134,7 +130,6 @@ async fn optimize_image(
         enforce_cache_limit(&mut cache_lock);
     }
 
-    // Ответ с headers
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", result.content_type.parse().unwrap());
     headers.insert(
@@ -146,14 +141,12 @@ async fn optimize_image(
     Ok((StatusCode::OK, headers, result.data))
 }
 
-// Ограничение кэша по размеру
 fn enforce_cache_limit(cache: &mut HashMap<String, CacheEntry>) {
     let mut total_size: usize = cache.values().map(|e| e.size).sum();
     if total_size <= CACHE_MAX_SIZE {
         return;
     }
 
-    // Сортируем ключи по времени вставки (старые сначала)
     let mut keys: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.inserted)).collect();
     keys.sort_by_key(|(_, inserted)| *inserted);
 
@@ -176,7 +169,6 @@ fn process_image(data: Bytes, params: ImageParams) -> Result<ProcessedImageResul
     let original_width = img.width();
     let original_height = img.height();
 
-    // Ресайз изображения
     img = match (params.width, params.height) {
         (Some(w), Some(h)) => img.resize_exact(w, h, image::imageops::FilterType::Lanczos3),
         (Some(w), None) => img.resize(
